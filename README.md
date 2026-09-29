@@ -42,12 +42,16 @@ This repository is one of three that make up OurDAO:
 
 ```
 Soroban RPC ──getEvents──▶ indexer (worker.ts) ──▶ Postgres ──▶ REST API (index.ts) ──▶ frontend
+                                                       │
+                                                       │ LISTEN/NOTIFY (real-time)
+                                                       └──────▶ SSE (/api/stream) ──▶ frontend
 ```
 
-- **`src/indexer`** — a poll loop over the Soroban RPC `getEvents`, resuming from a persisted cursor (`indexer_cursor` table) rather than re-scanning from genesis on every restart. Each raw event is written to an append-only `events` log, then folded into the relevant derived table (`members`, `loan_proposals`, `loans`, `treasury_proposals`, `notifications`) inside a single database transaction, so a crash mid-poll can never leave the derived tables and the raw log inconsistent. Poll failures back off exponentially (capped, configurable) instead of hammering the RPC endpoint. The `events` log is never pruned; its growth per unit of DAO activity, the secondary-index costs, and the point at which partitioning becomes worthwhile are documented in [`docs/events-storage.md`](./docs/events-storage.md) (measure with `npm run bench:events`).
+- **`src/indexer`** — a poll loop over the Soroban RPC `getEvents`, resuming from a persisted cursor (`indexer_cursor` table) rather than re-scanning from genesis on every restart. Each raw event is written to an append-only `events` log, then folded into the relevant derived table (`members`, `loan_proposals`, `loans`, `treasury_proposals`, `notifications`) inside a single database transaction, so a crash mid-poll can never leave the derived tables and the raw log inconsistent. After each successful fold, the indexer sends a Postgres NOTIFY to alert connected clients of the change. Poll failures back off exponentially (capped, configurable) instead of hammering the RPC endpoint. The `events` log is never pruned; its growth per unit of DAO activity, the secondary-index costs, and the point at which partitioning becomes worthwhile are documented in [`docs/events-storage.md`](./docs/events-storage.md) (measure with `npm run bench:events`).
 - **`src/stellar/events.ts`** — the event catalog: the exact topic-symbol → data-tuple mapping the contract publishes, decoded via `scValToNative` and converted to JSON-safe primitives (bigints become strings, since JSON has no native 128-bit integer type).
-- **`src/api`** — a [Fastify](https://fastify.dev) server exposing the read endpoints in the [API reference](#api-reference) below.
+- **`src/api`** — a [Fastify](https://fastify.dev) server exposing the read endpoints in the [API reference](#api-reference) below. Includes both request/response REST routes and a Server-Sent Events (SSE) stream at `/api/stream` for real-time notifications.
 - **`src/db`** — the Postgres schema (applied idempotently on boot by both the API and worker processes) and a thin query helper over [`pg`](https://node-postgres.com/).
+- **Real-time notifications** — the indexer and API processes communicate through Postgres LISTEN/NOTIFY. After each fold transaction commits, a NOTIFY fires, which the API's shared listener receives and fans out to connected SSE clients. This message-passing topology is documented in detail in [`docs/REALTIME-NOTIFICATIONS.md`](./docs/REALTIME-NOTIFICATIONS.md), including delivery guarantees, connection costs, and PgBouncer incompatibility.
 
 The API process and the indexer worker are separate entrypoints (`index.ts` / `worker.ts`) so they can be scaled or deployed independently — e.g. one long-running indexer worker behind several stateless, horizontally-scaled API instances.
 
@@ -154,7 +158,7 @@ On-chain `i128` amounts are stored as `NUMERIC(40,0)` (an i128's max value is ~1
 
 **Vote tallies are stake-weighted, not a headcount.** The contract grants each voter `1 + min(stake / STAKE_WEIGHT_UNIT, MAX_STAKE_BONUS)` voting power (currently up to 6) and sums that into `for_votes`/`against_votes`. `votes_for`/`votes_against` mirror that (hence `NUMERIC(40,0)`, matching the contract's own field width, not a plain vote count); `voter_count` is the distinct-voter headcount alongside it, so a client can show both "7 members voted" and "carrying 19 voting power." **The contract doesn't publish the weight it applied yet** — `loan_vote`/`tre_vote`/`revealed` currently carry only `support` — so today every vote folds in as weight 1 regardless of stake, and `votes_for`/`votes_against` under-count for any staked voter until [the upstream fix](https://github.com/ourdao/ourdao-contracts) lands. The API explicitly surfaces a `tallies_weighted: false` flag on proposals until this is resolved. The decoder and handlers already read a `weight` field the moment the contract adds one, with no further backend change needed.
 
-**A loan's `outstanding` balance starts at `total_repayment`, not the principal.** The contract collects `total_repayment = amount + interest` on `repay_loan`, so a loan is never worth just its principal from a borrower's perspective. `loan_appr` doesn't publish `total_repayment` (only the disbursed `amount`), so the indexer sources it from the just-approved `loan_proposals` row instead — `loans.id == loan_proposals.id` is a documented contract invariant, and that row already carries `total_repayment` from `loan_req`/`loan_edit`. This depends on that proposal row existing, which it will unless the indexer started mid-history; if it's missing, `total_repayment` falls back to the principal. `due_time` has the same gap — the contract computes it but doesn't publish it on `loan_appr` — so it's `NULL` until that's fixed upstream. `GET /api/loans` and `/api/loans/:id` also expose `interest_charge` and `repaid_amount`, both derived from `total_repayment` at read time.
+**A loan's `outstanding` balance starts at `total_repayment`, not the principal.** The contract collects `total_repayment = amount + interest` on `repay_loan`, so a loan is never worth just its principal from a borrower's perspective. `loan_appr` doesn't publish `total_repayment` (only the disbursed `amount`), so the indexer sources it from the just-approved `loan_proposals` row instead — `loans.id == loan_proposals.id` is a documented contract invariant, and that row already carries `total_repayment` from `loan_req`/`loan_edit`. This depends on that proposal row existing, which it will unless the indexer started mid-history; if it's missing, `total_repayment` falls back to the principal. `due_time` has the same gap — the contract computes it but doesn't publish it on `loan_appr` — so it's `NULL` until that's fixed upstream. `GET /api/loans` and `/api/loans/:id` also expose `interest_charge` and `repaid_amount`, both derived from `total_repayment` at read time (`null` for a loan whose amount columns are malformed — see `src/api/loan-derived.ts`; the rest of the list is unaffected).
 
 **Required fields are validated, not coerced (issue #42).** Every handler in `src/indexer/handlers.ts` reads its decoded fields through either the `require*` helpers (`requireAddr`/`requireId`/`requireAmount`/`requireBool`/`requireProposalKind`) or the older `str`/`num`/`addr` coercion helpers. The `require*` helpers are for a field a derived row depends on — a missing or malformed one throws instead of silently coercing into a plausible-looking default (a missing amount becoming `'0'`, a bad id becoming `NULL` and matching zero rows, a non-string address becoming `''`). `str`/`num`/`addr` are kept only for genuinely optional fields with no on-chain equivalent yet (`weight`, `due_time`) or that no stored row depends on. A thrown `FieldValidationError` rolls back the write and is handled the same way any other deterministic handler error is — see [Quarantine](#quarantine).
 
@@ -201,34 +205,65 @@ The full topic-symbol → data-tuple mapping this service decodes (kept in sync 
 
 ## API reference
 
+**Machine-readable OpenAPI specification:** [`openapi.json`](./openapi.json)
+
+Interactive documentation is available at `/docs` when running the development server (`npm run dev`).
+
+### Quick reference
+
 Base path: `/api`.
 
-| Method & path | Description |
-|---|---|
-| `GET /health` | Liveness check + the currently configured contract id. No DB round trip. |
-| `GET /ready` | Readiness probe — checks Postgres reachability and indexer freshness. Returns `503` with a `reason` when Postgres is down or the indexer cursor is stale. |
-| `GET /api/stats` | Aggregate counts (members, loans, proposals) + defaulted-loan count/value + lifetime money figures (`interestCollected`, `principalLent`, `principalRepaid`, `valueDefaulted`, all decimal strings) + `quarantinedEvents` (issue #43) + `lastIndexedLedger` (highest ledger actually folded) and `observedTipLedger` (RPC-observed chain tip, issue #45) as the useful "folded to X, chain is at Y" pair + `connectedStreams` (live SSE connection count on this process, issue #156) + `notificationFailures` (count of failed stream NOTIFYs since process start, issue #169). Cached in-process for `STATS_CACHE_MS` (except `connectedStreams`/`notificationFailures`, which are always live); sets `Cache-Control`. With more than one API instance the cached figures may briefly disagree. |
-| `GET /api/interest` | Interest-distribution history — one row per `interest` event (`amount` collected, `active_members` at that distribution). `?before=<ledger>` cursor. |
-| `GET /api/members` | Active members. |
-| `GET /api/members/:address` | Single member. |
-| `GET /api/members/:address/summary` | Member's dashboard data, including the member row, up to 100 loans, unread notification count, and their relative position to DAO totals (share percentages in basis points) in a single consistent snapshot. |
-| `GET /api/members/:address/activity` | Every event that names this address as a participant (joins, stakes, loan actions, votes), newest first (issue #26). `?before=<ledger>` cursor. Each entry is the decoded event: `id`, `symbol`, `ledger`, `timestamp`, `tx_hash`, and named `fields`. |
-| `GET /api/proposals/loan` | Loan proposals with vote tallies (`votes_for`/`votes_against`), a distinct `voter_count`, and an explicit `tallies_weighted: false` flag. |
-| `GET /api/loans` | Loans. Optional `?borrower=`, `?before=<id>` for pagination. `status` is `active`, `repaid`, or `defaulted` — a loan is marked defaulted once it's past due plus the policy's grace period (permissionless on-chain, see `ourdao-contracts`). Each loan includes derived `interest_charge` and `repaid_amount` fields. |
-| `GET /api/loans/:id` | Single loan, with the same derived `interest_charge`/`repaid_amount` fields. |
-| `GET /api/loans/:id/timeline` | A loan's full lifecycle in chronological order (issue #26): `loan_req`, `loan_edit`, `loan_vote`, `loan_wait`, `loan_rej`, `loan_appr`, `loan_rpy`, `loan_dflt`, `loan_exp`. Returns `{ "timeline": [...] }` where each entry is the decoded event — `id`, `symbol`, `ledger`, `timestamp`, `tx_hash`, and named `fields` (not raw JSONB). A nonexistent id returns an empty timeline (`200`), not a `404`. |
-| `GET /api/proposals/treasury` | Treasury proposals with vote tallies, a distinct `voter_count`, and an explicit `tallies_weighted: false` flag. |
-| `GET /api/proposals/treasury/:id/timeline` | A treasury proposal's full lifecycle in chronological order (issue #26): `tre_prop`, `tre_vote`, `committed`, `revealed`, `tre_wait`, `tre_rej`, `tre_exec`. Same shape and empty-not-404 behaviour as the loan timeline. |
-| `GET /api/notifications?address=` | Notifications for an address. |
-| `PATCH /api/notifications/:id/read` | Mark one notification read. |
-| `PATCH /api/notifications/read-all?address=` | Mark every unread notification for an address read. |
-| `GET /api/events` | Raw event feed. Optional `?symbol=`, `?before=<id|ledger>`, `?after=<id|ledger>`, `?order=asc|desc`. |
-| `GET /api/admin/log` | Admin/governance audit trail — init, admin add/remove, threshold changes, policy changes, pause/unpause. |
-| `GET /api/documents?kind=&proposal_id=` | A proposal's attached-document history (issue #44) — existence/history only, never the content hash (still read live from the contract via `get_document`). `kind` (`loan` or `treasury`) and `proposal_id` are both required, since loan and treasury proposal ids are drawn from independent sequences and collide. `?before=<ledger>` cursor. |
-| `GET /api/admin/failed-events` | Quarantined events (issue #43) — the operator-facing detail behind `/api/stats.quarantinedEvents`. Each row has the event id, symbol, ledger, the error that quarantined it, and `resolved_at` (issue #168, null while still outstanding); the raw `events` row itself is left untouched. `?unresolved=true` narrows the list to `resolved_at IS NULL`. |
-| `GET /api/stream` | Server-Sent Events stream of real-time change notifications (issue #63). Registered inside the `/api` plugin like every other route (issue #158). Sends lightweight change signals like `members_changed`, `loan_proposals_changed` as the indexer folds events — clients refetch via the endpoints above. Each message includes the channel name and timestamp. Optional `?channels=members,loans` subscribes to only that subset instead of every channel (issue #160) — see [Security notes](#security-notes) for why there is no per-member channel. The stream uses Postgres `LISTEN`/`NOTIFY` under the hood (`pg_notify` with bound parameters, issue #153): every API instance keeps exactly **one** shared listener connection for the whole process and fans notifications out to its own connected clients in-process (issue #152), rather than each client holding a dedicated connection — multiple instances still fan out independently without coordination. The server enforces backpressure (issue #157), concurrent connection caps with `503` + `Retry-After` (issue #156), and a socket idle timeout. The initial handshake stays under the global request rate limiter; open connections are bounded by `STREAM_MAX_*` rather than the request limiter (see Security notes). See [Reconnecting and missed changes](#reconnecting-and-missed-changes) for the `id`/`Last-Event-ID` guarantee. |
+**Core endpoints:**
+- `GET /health` — Liveness check + currently configured contract id (no DB round trip)
+- `GET /ready` — Readiness probe (checks Postgres reachability and indexer freshness)
+- `GET /version` — Build metadata (version, commit, build date)
+- `GET /api/stats` — Aggregate DAO statistics (members, loans, proposals, money figures, quarantine count, indexer state)
 
-All list endpoints accept `?limit=` (default 50, max 200). `?before=` and `?after=` are cursors: pass the `id` (or `ledger`) of the last row you saw to page. For `/api/events`, the cursor can be a deterministic `(ledger, id)` value (the event `id` string itself contains both) and ordering is strictly deterministic (`ledger DESC, id DESC` by default, or `ASC`). On-chain `i128` amounts are returned as decimal **strings** to preserve precision (see [Database schema](#database-schema)); ledger sequence numbers are returned as regular JSON numbers.
+**Members:**
+- `GET /api/members` — Active members list
+- `GET /api/members/:address` — Single member details
+- `GET /api/members/:address/summary` — Member dashboard (member row, loans, notifications, relative position)
+- `GET /api/members/:address/activity` — Member's cross-entity activity feed
+
+**Loans:**
+- `GET /api/proposals/loan` — Loan proposals with vote tallies
+- `GET /api/loans` — Loans list (optional `?borrower=` filter)
+- `GET /api/loans/:id` — Single loan
+- `GET /api/loans/:id/timeline` — Loan's full lifecycle events
+
+**Treasury:**
+- `GET /api/proposals/treasury` — Treasury proposals with vote tallies
+- `GET /api/proposals/treasury/:id/timeline` — Treasury proposal's full lifecycle events
+
+**Notifications:**
+- `GET /api/notifications?address=` — Notifications for an address
+- `PATCH /api/notifications/:id/read` — Mark one notification read (authenticated)
+- `PATCH /api/notifications/read-all?address=` — Mark all notifications read (authenticated)
+
+**Events & History:**
+- `GET /api/events` — Raw event feed (optional filters: `?symbol=`, `?contract=`, `?before=`, `?after=`, `?order=`)
+- `GET /api/interest` — Interest distribution history
+- `GET /api/documents?kind=&proposal_id=` — Proposal document attachment history
+
+**Admin:**
+- `GET /api/admin/log` — Admin/governance audit trail
+- `GET /api/admin/failed-events` — Quarantined events
+
+**Real-time:**
+- `GET /api/stream` — Server-Sent Events stream for real-time change notifications
+
+**Authentication:**
+- `GET /api/auth/challenge` — Request a nonce for signature-based authentication
+
+For detailed request/response schemas, query parameters, and authentication requirements, see the [OpenAPI specification](./openapi.json) or visit `/docs` on a running instance.
+
+**Frontend integration:** The OpenAPI spec can be used to generate type-safe client code for `ourdao-frontend`. Tools like [openapi-typescript](https://github.com/drwpow/openapi-typescript) or [openapi-generator](https://github.com/OpenAPITools/openapi-generator) can consume `openapi.json` directly to generate TypeScript types matching the API's actual response shapes, eliminating manual transcription of types from `src/types.ts`.
+
+### Common patterns
+
+All list endpoints accept `?limit=` (default 50, max 200). `?before=` and `?after=` are cursors: pass the `id` (or `ledger`) of the last row you saw to page. For `/api/events`, the cursor can be a deterministic `(ledger, id)` value and ordering is strictly deterministic (`ledger DESC, id DESC` by default, or `ASC`). 
+
+On-chain `i128` amounts are returned as decimal **strings** to preserve precision (see [Database schema](#database-schema)); ledger sequence numbers are returned as regular JSON numbers.
 
 ### Reconnecting and missed changes
 
@@ -263,10 +298,18 @@ Postgres failures are mapped to a sensible status rather than an opaque `500`: a
 
 ### Caching
 
-All `GET` endpoints support `ETag` and conditional requests (`If-None-Match`), returning `304 Not Modified` when the underlying data is unchanged. `Cache-Control` headers are set appropriately:
-- **Historical immutable queries** (`/events`, `/admin/log`, `/interest`, `/documents` with a `?before=` or `?after=` cursor) are cached indefinitely (`public, max-age=31536000, immutable`).
-- **Live tip queries** use a short TTL (`public, max-age=5, must-revalidate`).
-- **Per-address queries** (`/notifications`, `/members/:address/summary`) are never cached by shared caches (`private, no-cache`).
+Every response's `Cache-Control` comes from one of four **named policies** defined in [`src/api/cache-policy.ts`](src/api/cache-policy.ts). Routes select a policy by name (`setCachePolicy(reply, 'public-live')`); nothing writes a raw directive, and `test/cache-policy.test.ts` fails on an ad-hoc `Cache-Control` literal or a route that answers with a value outside the set.
+
+| Policy | Header | Applies to |
+|---|---|---|
+| `public-live` | `public, max-age=5, must-revalidate` | Tip-of-chain reads: `/members`, `/members/:address`, `/members/:address/activity`, `/proposals/*`, `/loans`, `/loans/:id`, the two `/timeline` routes, `/stats`, and `/events`, `/admin/log`, `/interest`, `/documents` **without** a cursor. |
+| `public-historical` | `public, max-age=31536000, immutable` | `/events` (`?before=`/`?after=`), `/admin/log`, `/interest`, `/documents` with a cursor. |
+| `private` | `private, no-cache` | Member-specific data: `/members/:address/summary`, `/notifications`. Never `public`. |
+| `no-store` | `no-store` | Authentication challenges, `PATCH` mutations, `/health`, `/ready`, `/version`, `/admin/failed-events`, and the `/stream` SSE endpoint. |
+
+- **Default:** a route that names no policy gets `no-store` (an `onRequest` hook), so omitting a decision can never make a response cacheable. An unknown directive is replaced with `no-store` and logged.
+- **Authenticated responses are never shared-cacheable:** a request carrying an `Authorization` header is downgraded from any `public-*` policy to `private`.
+- **ETag and revalidation:** `@fastify/etag` is registered globally. `public-live` and `private` rely on it — after `max-age` (or immediately, for `private`) the client sends `If-None-Match` and gets `304` when nothing changed. `public-historical` is deliberately never revalidated (`immutable` skips the conditional request). `no-store` responses carry no `ETag`, since nothing may be stored to revalidate.
 
 ### Reorg detection
 
@@ -332,6 +375,7 @@ Tests apply the real `schema.sql` and truncate all tables between runs (`test/db
 
 - **No custody, ever.** This service holds no private keys and has no code path that constructs, signs, or submits a transaction. It is a read model over public on-chain events.
 - **Fail-soft, not fail-open.** If the indexer falls behind or the RPC endpoint is unreachable, reads degrade to stale/empty data (surfaced to the frontend as such) rather than the API crashing or serving incorrect state.
+- **Database-pressure policy.** Health, readiness, and ordinary state reads (`/members`, proposals, loans, notifications, and event pages) have priority. `GET /api/stats` is the aggregate, lower-priority endpoint: only `STATS_MAX_CONCURRENT` cache-miss recomputations may run per API process (default 1). Further misses receive `503` with `Retry-After` instead of queueing for a database connection. If a recomputation fails after a prior success, the API returns that last value with `X-Data-Stale: true`; a first-ever failed computation still returns the normal database failure. This keeps useful reads available while making the degraded stats result explicit.
 - **CORS is explicit.** `CORS_ORIGIN` defaults to `http://localhost:3000` in both code and config — a production deployment should set this to the real frontend origin. Setting it to `*` is supported as an explicit opt-in but logs a warning at startup.
 - **Input handling.** All route parameters (addresses, ids, cursors) are validated before being used in parameterized queries — no raw string interpolation of attacker-influenceable values into SQL anywhere in the codebase. Stream notifications use `SELECT pg_notify($1, $2)` with bound parameters (issue #153); the shared listener's one-time `LISTEN` (issue #152) still interpolates channel names, drawn from the frozen `STREAM_CHANNELS` constant, never user input.
 - **NOTIFY is isolated from the fold (issue #169).** The indexer's fold transaction only decides *which* stream channel changed; the actual `NOTIFY` is sent afterwards, once that transaction has committed, on a separate connection from the shared pool — never on the fold transaction's own client. A `NOTIFY` failure (oversized payload, a dropped connection) can therefore never roll back or otherwise affect a fold that already succeeded. Failures are logged as structured JSON (`src/logger.ts`) and counted in `GET /api/stats.notificationFailures`.
@@ -339,6 +383,7 @@ Tests apply the real `schema.sql` and truncate all tables between runs (`test/db
   - **`G…` (ed25519)** — verified directly against the account's public key.
   - **`M…` (muxed)** — resolved to the underlying `G…` account and verified against its key. Sign the same `"<nonce>:<address>"` payload using the `M…` address as it appears in the header.
   - **`C…` (contract) accounts are not supported.** A Soroban contract account has no ed25519 key and authorizes through its `__check_auth` entrypoint, which requires an on-chain RPC call to verify. Authenticating with a `C…` address returns `400` with an explicit message rather than a misleading `401 "Invalid signature"`. If contract-wallet auth is needed, open an issue — it needs an RPC call in the auth path and a caching strategy.
+- **Nonce reuse prevents denial-of-service.** When a nonce is requested for an address that already has a valid unexpired nonce, `issue()` returns the existing nonce instead of overwriting it. This prevents an attacker from invalidating a victim's pending nonce by requesting a new challenge for the victim's address, and also prevents self-invalidation when a user opens multiple tabs. Nonces expire after 5 minutes. Note: this behavior addresses one denial-of-service vector, but several related issues remain open: consume-before-verify ordering (#115), unchecked store capacity reporting (#135), non-atomic nonce operations, and the nonce's changed secrecy properties.
 - **Dependency Scanning.** Dependencies are scanned weekly via Dependabot, and `npm audit` is run in CI to report on vulnerabilities.
 - **Rate limiting.** Global rate limiting (`@fastify/rate-limit`) is applied to all API endpoints, with a stricter per-route limit on `GET /api/events`. Health and readiness probes are exempt. Behind a reverse proxy, set `TRUST_PROXY=true` so limits apply per client IP. With in-process limiting, the effective global limit is `RATE_LIMIT_MAX × instance count`.
 - **`GET /api/stream` rate-limit treatment (issue #158).** The stream route is registered inside the `/api` plugin (same prefix and encapsulation as every other route) and is **not** exempt from the global request rate limiter — the initial handshake is a request and counts toward `RATE_LIMIT_MAX`. A long-lived open socket is not a request in the sense the limiter models, so open connections are bounded separately by `STREAM_MAX_CONNECTIONS` / `STREAM_MAX_CONNECTIONS_PER_IP` (issue #156); exceeding either returns `503` with `Retry-After`. The live count is exposed as `connectedStreams` on `GET /api/stats`.

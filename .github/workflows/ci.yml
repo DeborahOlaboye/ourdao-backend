@@ -6,9 +6,14 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       matrix:
         node-version: [20, 22, 24]
@@ -51,6 +56,12 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: OpenAPI spec is up to date
+        run: npm run openapi:validate
+
+      - name: License check
+        run: npm run license:check
+
       # Runs the full suite with v8 coverage instrumentation and enforces the
       # thresholds in vitest.config.ts (#79). Replaces the plain `npm test`
       # step — same tests, plus the report. Observed runtime delta on CI: a
@@ -83,6 +94,7 @@ jobs:
   # attributable at a glance and doesn't block the source gates.
   docker-build:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
 
     services:
       postgres:
@@ -119,6 +131,21 @@ jobs:
           build-args: |
             SOURCE_COMMIT=${{ github.sha }}
             BUILD_DATE=${{ github.event.repository.updated_at }}
+          # Issue #219: generate SBOM covering base image + npm dependencies
+          sbom: true
+          provenance: false
+
+      - name: Extract SBOM
+        run: |
+          docker buildx imagetools inspect "$IMAGE" --format '{{json .SBOM}}' > sbom.json
+          echo "SBOM artifact generated: sbom.json ($(wc -c < sbom.json) bytes)"
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.json
+          retention-days: 90
 
       # Vulnerability scan (#212): scan the built image with Trivy.
       # Publishes full findings to GitHub Actions step summary and enforces
@@ -196,24 +223,30 @@ jobs:
           docker run -d --name api --network host \
             --health-interval=3s --health-start-period=3s --health-retries=10 \
             -e DATABASE_URL="$DB_URL" -e PORT=4000 -e CONTRACT_ID=CTEST "$IMAGE"
+          status=starting
           for _ in $(seq 1 40); do
             s="$(docker inspect -f '{{.State.Health.Status}}' api)"
-            [ "$s" = healthy ] && break
-            [ "$s" = unhealthy ] && break
+            [ "$s" = healthy ] && { status=healthy; break; }
+            [ "$s" = unhealthy ] && { status=unhealthy; break; }
             sleep 2
           done
           echo "--- api logs ---"; docker logs api
           curl -fsS -o /dev/null -w 'GET /health -> %{http_code}\n' http://localhost:4000/health
           docker rm -f api >/dev/null
-          test "$s" = healthy
+          test "$status" = healthy
 
       - name: worker entrypoint boots and exits 0 on SIGTERM
         run: |
           docker run -d --name worker --network host \
             -e DATABASE_URL="$DB_URL" -e CONTRACT_ID=CTEST \
             "$IMAGE" node dist/worker.js
-          sleep 10
+          # Bound startup observation independently of the job timeout.
+          for _ in $(seq 1 10); do
+            docker inspect -f '{{.State.Running}}' worker | grep -qx true || break
+            sleep 1
+          done
           echo "--- worker logs ---"; docker logs worker
+          docker inspect -f '{{.State.Running}}' worker | grep -qx true
           docker stop -t 15 worker
           code="$(docker inspect -f '{{.State.ExitCode}}' worker)"
           echo "worker exit code: $code"

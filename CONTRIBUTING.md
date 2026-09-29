@@ -74,6 +74,8 @@ Two more checks CI runs that aren't in the list above:
 - **Its description explains why, not just what.**
 - **It updates CHANGELOG.md for user-visible changes.** Any pull request that alters an API response, adds or alters a route, introduces a database migration, or requires an operator action (e.g. reindex) must include an entry under the `[Unreleased]` section of [CHANGELOG.md](./CHANGELOG.md), explicitly marking `[Migration: <file>]` or `[Requires Reindex]` as applicable.
 - **CI is green** before you request review.
+- **Pull requests require review from code owners.** Changes to `src/indexer/`, `src/auth.ts`, and `src/db/migrations/` have stricter review requirements enforced by GitHub's CODEOWNERS file. Wait for the required review before merging.
+- **If you add or change API routes, regenerate the OpenAPI spec.** Run `npm run openapi:generate` and commit the updated `openapi.json`. CI will fail if the committed spec doesn't match what the routes produce.
 
 ## Backend-specific rules
 
@@ -88,6 +90,18 @@ Two more checks CI runs that aren't in the list above:
 - **Bigints serialize as strings.** JSON has no native 128-bit integer type. Keep the existing conversion discipline — don't let a raw bigint reach a response body.
 - **`NUMERIC(40,0)` for amounts, `BIGINT` only for sequences.** On-chain `i128` amounts are `NUMERIC(40,0)` and cross the API as strings. Ledger/sequence numbers are `BIGINT` and returned as JSON numbers via a `BIGINT → number` parser scoped to the pool in `src/db/index.ts`. A token amount stored as `BIGINT` would be parsed to a `number` and lose precision above 2⁵³ silently — never do that. See the README's [Database schema](./README.md#database-schema).
 - **Schema changes are additive where possible.** If you must change an existing column, say so explicitly in the PR description, since the schema is applied on boot against existing databases.
+
+### Schema changes
+
+When adding a database migration:
+
+- **Pick a unique, sequential version number.** Migrations are numbered `0001`, `0002`, `0003`, etc. Look at the highest-numbered file in `src/db/migrations/` and use the next integer. Two migrations with the same version will conflict — `schema_migrations.version` is a primary key, so only one will ever be recorded.
+- **Name the file `<version>_<description>.sql`.** For example, `0015_add_member_email.sql`. The version is parsed from the filename prefix and must match the pattern `^\d+_.*\.sql$`.
+- **Update `src/db/schema.sql` in the same PR.** `schema.sql` is the bootstrap baseline for fresh databases — it describes the *current* desired state after all migrations. Your migration applies the change to an *existing* database; `schema.sql` applies it to a *new* one. If you only add the migration file, a fresh database built from `schema.sql` won't have your change, because `CREATE TABLE IF NOT EXISTS` silently no-ops when the table already exists. The test suite builds from `schema.sql` alone, so a migration-only change is untested.
+- **The fresh-database shortcut:** when `migrate()` runs against a database with no prior migrations (`schema_migrations` is empty), it records all migration files as applied without re-running their SQL. This is safe because `schema.sql` just created the end state directly. The SQL in your migration file is only executed against databases that predate it.
+- **Manual verification required.** The test suite does not exercise migrations — it applies `schema.sql` to a fresh database and truncates tables between tests. A migration needs manual verification against a pre-existing database to confirm the `ALTER` statement works as expected.
+
+See the README's [Database schema](./README.md#database-schema) section for the full picture of how `schema.sql` and `migrations/` work together.
 
 ## What gets closed without review
 

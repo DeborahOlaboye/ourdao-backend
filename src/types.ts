@@ -53,7 +53,8 @@ export interface MemberSummary {
   // via GET /api/loans?borrower=<address>. The aggregate counts in
   // `position` below are computed over ALL of the member's loans regardless
   // of this cap, never just the embedded page.
-  loans: (LoanRow & { interest_charge: string; repaid_amount: string })[]
+  // Derived fields are null for a loan with a malformed amount column (issue #195).
+  loans: (LoanRow & { interest_charge: string | null; repaid_amount: string | null })[]
   loans_total_count: number
   loans_truncated: boolean
   unread_notifications: number
@@ -210,8 +211,14 @@ export interface DAOStats {
   valueDefaulted: string
   // Quarantined-event count (issue #43) — a handler that deterministically
   // throws no longer wedges the indexer forever; this is the "we quarantined
-  // N events" signal a dashboard needs so that isn't invisible.
+  // N events" signal a dashboard needs so that isn't invisible. Issue #171:
+  // now counts distinct failing events, not failure count (one event can fail
+  // multiple times but is counted once).
   quarantinedEvents: number
+  // Issue #174: timestamp when quarantine last escalated to per-event folding.
+  // An operator should alert when this transitions from null to non-null,
+  // signaling data loss in one or more derived tables.
+  quarantineEscalatedAt: string | null
   // `lastIndexedLedger` is the highest ledger actually folded; `observedTipLedger`
   // is the RPC's most recently observed chain tip (issue #45) — "folded to X,
   // chain is at Y" is the useful pair for gauging indexer lag.

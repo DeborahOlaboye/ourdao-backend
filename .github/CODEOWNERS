@@ -1,0 +1,14 @@
+# GitHub will automatically request reviews from the code owners listed below.
+# See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owners for everything in src/
+/src/ @PLACEHOLDER_OWNER
+
+# Stricter ownership for money-relevant state folding
+/src/indexer/ @PLACEHOLDER_OWNER
+
+# Authorization boundary - requires owner review
+/src/auth.ts @PLACEHOLDER_OWNER
+
+# Schema migrations - irreversible changes to production databases
+/src/db/migrations/ @PLACEHOLDER_OWNER

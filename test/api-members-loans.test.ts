@@ -52,14 +52,17 @@ describe('API: members and loans', () => {
   })
 
   it('GET /api/loans filters by borrower', async () => {
+    const borrowerA = Keypair.random().publicKey()
+    const borrowerB = Keypair.random().publicKey()
     await query(
       `INSERT INTO loans (id, borrower, amount, outstanding, status) VALUES
-       (1, 'GA', 100, 100, 'active'), (2, 'GB', 200, 0, 'repaid'), (3, 'GA', 300, 300, 'active')`
+       (1, $1, 100, 100, 'active'), (2, $2, 200, 0, 'repaid'), (3, $1, 300, 300, 'active')`,
+      [borrowerA, borrowerB]
     )
-    const res = await app.inject({ method: 'GET', url: '/api/loans?borrower=GA' })
+    const res = await app.inject({ method: 'GET', url: `/api/loans?borrower=${borrowerA}` })
     const body = res.json()
     expect(body).toHaveLength(2)
-    expect(body.every((l: { borrower: string }) => l.borrower === 'GA')).toBe(true)
+    expect(body.every((l: { borrower: string }) => l.borrower === borrowerA)).toBe(true)
   })
 
   it('GET /api/loans supports before-id cursor pagination', async () => {

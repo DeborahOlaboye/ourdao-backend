@@ -27,7 +27,7 @@ describe('API: /members/:address/summary', () => {
   afterAll(closeDb)
 
   it('GET /api/members/:address/summary returns 404 for unknown address', async () => {
-    const res = await app.inject({ method: 'GET', url: '/api/members/GBIU43K4ICLBGTVHSQJH7F37Y6R6IAGAGJJTNZGJV2GD4V3PD4DG42R3/summary' })
+    const res = await app.inject({ method: 'GET', url: `/api/members/${NOBODY}/summary` })
     expect(res.statusCode).toBe(404)
   })
 
@@ -35,29 +35,29 @@ describe('API: /members/:address/summary', () => {
     await query(`
       INSERT INTO members (address, joined_ledger, contribution, stake, exited)
       VALUES 
-      ('GBIU43K4ICLBGTVHSQJH7F37Y6R6IAGAGJJTNZGJV2GD4V3PD4DG42R3', 100, '5000', '1000', false),
-      ('GD2XX', 100, '5000', '1000', false)
-    `)
+      ($1, 100, '5000', '1000', false),
+      ($2, 100, '5000', '1000', false)
+    `, [MEMBER_A, MEMBER_B])
 
     await query(`
       INSERT INTO loans (id, borrower, amount, outstanding, total_repayment, status)
       VALUES 
-      (1, 'GBIU43K4ICLBGTVHSQJH7F37Y6R6IAGAGJJTNZGJV2GD4V3PD4DG42R3', '1000', '1000', '1100', 'active'),
-      (2, 'GBIU43K4ICLBGTVHSQJH7F37Y6R6IAGAGJJTNZGJV2GD4V3PD4DG42R3', '500', '0', '550', 'repaid')
-    `)
+      (1, $1, '1000', '1000', '1100', 'active'),
+      (2, $1, '500', '0', '550', 'repaid')
+    `, [MEMBER_A])
 
     await query(`
       INSERT INTO notifications (address, type, title, message, read)
       VALUES 
-      ('GBIU43K4ICLBGTVHSQJH7F37Y6R6IAGAGJJTNZGJV2GD4V3PD4DG42R3', 'info', 'Test', 'Msg', false),
-      ('GBIU43K4ICLBGTVHSQJH7F37Y6R6IAGAGJJTNZGJV2GD4V3PD4DG42R3', 'info', 'Test 2', 'Msg 2', true)
-    `)
+      ($1, 'info', 'Test', 'Msg', false),
+      ($1, 'info', 'Test 2', 'Msg 2', true)
+    `, [MEMBER_A])
 
-    const res = await app.inject({ method: 'GET', url: '/api/members/GBIU43K4ICLBGTVHSQJH7F37Y6R6IAGAGJJTNZGJV2GD4V3PD4DG42R3/summary' })
+    const res = await app.inject({ method: 'GET', url: `/api/members/${MEMBER_A}/summary` })
     expect(res.statusCode).toBe(200)
     
     const body = res.json()
-    expect(body.member.address).toBe('GBIU43K4ICLBGTVHSQJH7F37Y6R6IAGAGJJTNZGJV2GD4V3PD4DG42R3')
+    expect(body.member.address).toBe(MEMBER_A)
     expect(body.loans).toHaveLength(2)
     const loan1 = body.loans.find((l: { id: number }) => l.id === 1)
     const loan2 = body.loans.find((l: { id: number }) => l.id === 2)
@@ -81,9 +81,9 @@ describe('API: /members/:address/summary', () => {
   it('GET /api/members/:address/summary handles exited member position correctly', async () => {
     await query(`
       INSERT INTO members (address, joined_ledger, contribution, stake, exited)
-      VALUES ('GBIU43K4ICLBGTVHSQJH7F37Y6R6IAGAGJJTNZGJV2GD4V3PD4DG42R3', 100, '5000', '1000', true)
-    `)
-    const res = await app.inject({ method: 'GET', url: '/api/members/GBIU43K4ICLBGTVHSQJH7F37Y6R6IAGAGJJTNZGJV2GD4V3PD4DG42R3/summary' })
+      VALUES ($1, 100, '5000', '1000', true)
+    `, [MEMBER_A])
+    const res = await app.inject({ method: 'GET', url: `/api/members/${MEMBER_A}/summary` })
     expect(res.statusCode).toBe(200)
     const body = res.json()
     expect(body.position.stake_share_bps).toBe('0') // Exited member has 0% stake share
@@ -101,29 +101,32 @@ describe('API: /members/:address/summary', () => {
   // exited member — rather than the previous total_contribution
   // denominator, which counted every member who ever joined.
   it('GET /api/members/:address/summary computes contribution_share_bps against the active-only denominator', async () => {
+    const activeAddress = Keypair.random().publicKey()
+    const otherAddress = Keypair.random().publicKey()
+    const exitedAddress = Keypair.random().publicKey()
     await query(`
       INSERT INTO members (address, joined_ledger, contribution, stake, exited)
       VALUES
-      ('GBIU43K4ICLBGTVHSQJH7F37Y6R6IAGAGJJTNZGJV2GD4V3PD4DG42R3', 100, '3000', '0', false),
-      ('GD2XX', 100, '7000', '0', false),
-      ('GD3YY', 100, '9000', '0', true)
-    `)
+      ($1, 100, '3000', '0', false),
+      ($2, 100, '7000', '0', false),
+      ($3, 100, '9000', '0', true)
+    `, [activeAddress, otherAddress, exitedAddress])
     // Active-only total_contribution = 3000 + 7000 = 10000 (the exited
     // member's 9000 must not count).
-    const active = await app.inject({ method: 'GET', url: '/api/members/GBIU43K4ICLBGTVHSQJH7F37Y6R6IAGAGJJTNZGJV2GD4V3PD4DG42R3/summary' })
+    const active = await app.inject({ method: 'GET', url: `/api/members/${activeAddress}/summary` })
     expect(active.json().position.contribution_share_bps).toBe('3000') // 3000 / 10000
 
-    const other = await app.inject({ method: 'GET', url: '/api/members/GD2XX/summary' })
+    const other = await app.inject({ method: 'GET', url: `/api/members/${otherAddress}/summary` })
     expect(other.json().position.contribution_share_bps).toBe('7000') // 7000 / 10000
 
-    const exited = await app.inject({ method: 'GET', url: '/api/members/GD3YY/summary' })
+    const exited = await app.inject({ method: 'GET', url: `/api/members/${exitedAddress}/summary` })
     expect(exited.json().position.contribution_share_bps).toBe('0') // exited -> 0, regardless of their own contribution
   })
 
   // Issue #165: with more loans than LOANS_EMBED_LIMIT, the aggregate counts
   // must still reflect every loan, and the truncation must be visible.
   it('GET /api/members/:address/summary reports correct aggregates and visible truncation beyond the embed limit', async () => {
-    const address = 'GBIU43K4ICLBGTVHSQJH7F37Y6R6IAGAGJJTNZGJV2GD4V3PD4DG42R3'
+    const address = Keypair.random().publicKey()
     await query(`
       INSERT INTO members (address, joined_ledger, contribution, stake, exited)
       VALUES ($1, 100, '0', '0', false)

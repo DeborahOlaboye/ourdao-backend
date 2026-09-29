@@ -44,21 +44,22 @@ export class ReorgDetectedError extends Error {
 export async function resetForContractChange(): Promise<void> {
   const client = await pool.connect()
   try {
-    // Use pg_advisory_xact_lock instead of pg_try_advisory_lock (issue #137):
-    // pg_advisory_xact_lock is transaction-scoped and released on COMMIT,
-    // whereas pg_try_advisory_lock is session-scoped and can be left held
-    // if the process is killed between COMMIT and the explicit unlock.
-    const lockRes = await client.query<{ pg_advisory_xact_lock: boolean }>(
-      'SELECT pg_advisory_xact_lock($1)',
+    // Use pg_try_advisory_xact_lock so we fail fast if the lock is already
+    // held (e.g. a reindex or fold is in progress). pg_advisory_xact_lock
+    // blocks indefinitely; pg_try_advisory_xact_lock returns false immediately.
+    // The lock is transaction-scoped so it releases automatically on COMMIT
+    // or ROLLBACK — no explicit unlock is needed, preventing leaks on crash.
+    await client.query('BEGIN')
+    const lockRes = await client.query<{ pg_try_advisory_xact_lock: boolean }>(
+      'SELECT pg_try_advisory_xact_lock($1)',
       [REINDEX_LOCK_KEY]
     )
-    if (!lockRes.rows[0]?.pg_advisory_xact_lock) {
+    if (!lockRes.rows[0]?.pg_try_advisory_xact_lock) {
       throw new Error(
         'Cannot reset database for contract change: reindex or fold operation is currently in progress (advisory lock held)'
       )
     }
 
-    await client.query('BEGIN')
     await client.query(`TRUNCATE ${DERIVED_TABLES.join(', ')} RESTART IDENTITY`)
     await resetDaoTotals(client)
     await client.query('DELETE FROM indexer_cursor WHERE id = 1')
@@ -126,6 +127,21 @@ async function loadCursor(contractId: string): Promise<CursorRow | null> {
   return row
 }
 
+// Issue #173: saveCursor can fail on its own after folding succeeds. Track
+// these failures separately so the poll loop can distinguish:
+// 1. A transient saveCursor write failure (should be retried) — doesn't mean
+//    folding failed, just that persistence didn't complete
+// 2. A stalled indexer (the fold succeeded but the cursor wasn't persisted
+//    and later restarts/failures happen) — detected by examining cursor
+//    staleness vs actual folder progress
+//
+// Correctness holds today because folding is keyed on event id and is
+// idempotent. A cursor write failure followed by a crash leaves the fold
+// committed but the cursor behind; on restart the page is refetched but
+// events aren't re-applied (insertRawEvent's folded_at check — issue #119).
+// The issue is that /ready reports stale from an unchanging updated_at even
+// though events are being folded correctly. This tracking lets us distinguish
+// that case from a genuinely stalled indexer.
 async function saveCursor(
   contractId: string,
   pagingToken: string | null,
@@ -133,12 +149,22 @@ async function saveCursor(
   observedTipLedger: number,
   lastLedgerHash: string | null
 ): Promise<void> {
-  await pool.query(
-    `INSERT INTO indexer_cursor (id, paging_token, last_ledger, last_ledger_hash, observed_tip_ledger, contract_id, updated_at)
-     VALUES (1, $1, $2, $3, $4, $5, now())
-     ON CONFLICT (id) DO UPDATE SET paging_token = $1, last_ledger = $2, last_ledger_hash = $3, observed_tip_ledger = $4, contract_id = $5, updated_at = now()`,
-    [pagingToken, lastLedger, lastLedgerHash, observedTipLedger, contractId]
-  )
+  try {
+    await pool.query(
+      `INSERT INTO indexer_cursor (id, paging_token, last_ledger, last_ledger_hash, observed_tip_ledger, contract_id, updated_at)
+       VALUES (1, $1, $2, $3, $4, $5, now())
+       ON CONFLICT (id) DO UPDATE SET paging_token = $1, last_ledger = $2, last_ledger_hash = $3, observed_tip_ledger = $4, contract_id = $5, updated_at = now()`,
+      [pagingToken, lastLedger, lastLedgerHash, observedTipLedger, contractId]
+    )
+    // Clear any prior cursor write failure now that this one succeeded
+    cursorWriteFailures = null
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    cursorWriteFailures = { error: msg, at: Date.now() }
+    // Re-throw: the poll loop needs to know folding didn't complete
+    // (the fold itself succeeded, but its progress wasn't recorded).
+    throw new Error(`Cursor write failed: ${msg}`, { cause: err })
+  }
 }
 
 /** Touch updated_at without changing data — keeps freshness signal alive on idle contracts. */
@@ -273,12 +299,36 @@ async function ingestPage(events: rpc.Api.EventResponse[], lastLedger: number): 
   }
 }
 
+// Issue #173: saveCursor can fail after a page is folded, presenting as a
+// stalled indexer even though events are being ingested. Track cursor writes
+// separately so transient write failures don't wedge progress reporting.
+let cursorWriteFailures: { error: string; at: number } | null = null
+
+/** Issue #173: Get the last cursor write failure, if any. Used for diagnostics
+ *  to distinguish between a stalled indexer (fold succeeded, cursor write failed)
+ *  and genuine staleness (nothing is being folded).
+ */
+export function getCursorWriteFailures(): { error: string; at: number } | null {
+  return cursorWriteFailures
+}
+
 async function recordQuarantinedEvent(ev: DecodedEvent, error: unknown): Promise<void> {
   const message = error instanceof Error ? error.message : String(error)
-  await pool.query(
-    `INSERT INTO failed_events (event_id, symbol, ledger, error) VALUES ($1, $2, $3, $4)`,
-    [ev.id, ev.symbol, ev.ledger, message]
-  )
+  // Issue #171: fold failures of the same event into one row via UNIQUE constraint.
+  // ON CONFLICT updates the row so the latest error message is recorded.
+  try {
+    await pool.query(
+      `INSERT INTO failed_events (event_id, symbol, ledger, error, created_at)
+       VALUES ($1, $2, $3, $4, now())
+       ON CONFLICT (event_id) DO UPDATE SET error = $4, created_at = now()`,
+      [ev.id, ev.symbol, ev.ledger, message]
+    )
+  } catch (insertErr) {
+    throw new Error(
+      `Failed to record quarantined event ${ev.id} in failed_events: ${insertErr instanceof Error ? insertErr.message : String(insertErr)}`,
+      { cause: insertErr }
+    )
+  }
   console.error(`[indexer] quarantined event ${ev.id} (${ev.symbol}) at ledger ${ev.ledger}: ${message}`)
 }
 
@@ -387,16 +437,74 @@ interface QuarantineState {
   failures: number
 }
 
-// Tracks consecutive whole-page failures across poll iterations so a
-// transient error (RPC hiccup, DB restart — expected to clear on retry) is
-// told apart from a deterministic one (issue #43). Single indexer instance
-// per README, so in-memory state here is fine — it doesn't need to survive a
-// restart, and a restart just starts the same count over at the same page.
+interface QuarantineStateRow {
+  page_key: string | null
+  error_message: string | null
+  failures: number
+  escalated_at: string | null
+}
+
+// Issue #172: quarantine state now persists in the database so a restart
+// doesn't reset the counter. Loads on first use from the persistent row,
+// then updated in memory for performance. The database is the source of truth.
 let quarantineState: QuarantineState | null = null
+let quarantineStateLoaded = false
 
 function pageKeyFor(events: rpc.Api.EventResponse[]): string {
   if (events.length === 0) return ''
   return `${events[0]!.id}..${events[events.length - 1]!.id}:${events.length}`
+}
+
+// Issue #172: Load quarantine state from persistent storage. Called once per
+// poll cycle before quarantine logic runs. Returns null if the stored state is
+// for a different page (i.e., we've moved past the quarantined page).
+async function loadQuarantineState(): Promise<QuarantineState | null> {
+  try {
+    const row = await queryOne<QuarantineStateRow>(
+      'SELECT page_key, error_message, failures, escalated_at FROM quarantine_state WHERE id = 1'
+    )
+    if (!row || !row.page_key || !row.error_message) return null
+    return {
+      pageKey: row.page_key,
+      errorMessage: row.error_message,
+      failures: row.failures,
+    }
+  } catch (err) {
+    console.error(`[indexer] failed to load quarantine state: ${err instanceof Error ? err.message : String(err)}`)
+    return null
+  }
+}
+
+// Issue #172: Persist quarantine state so it survives a restart. On escalation
+// to per-event folding, marks the escalation timestamp for alerting (issue #174).
+async function persistQuarantineState(state: QuarantineState | null, escalating = false): Promise<void> {
+  try {
+    if (state === null) {
+      await pool.query(
+        `UPDATE quarantine_state SET page_key = NULL, error_message = NULL, failures = 1, escalated_at = NULL, updated_at = now() WHERE id = 1`
+      )
+    } else {
+      await pool.query(
+        `INSERT INTO quarantine_state (id, page_key, error_message, failures, escalated_at, updated_at)
+         VALUES (1, $1, $2, $3, ${escalating ? 'now()' : 'NULL'}, now())
+         ON CONFLICT (id) DO UPDATE SET page_key = $1, error_message = $2, failures = $3, escalated_at = COALESCE(EXCLUDED.escalated_at, quarantine_state.escalated_at), updated_at = now()`,
+        [state.pageKey, state.errorMessage, state.failures]
+      )
+    }
+  } catch (err) {
+    console.error(
+      `[indexer] failed to persist quarantine state: ${err instanceof Error ? err.message : String(err)}`
+    )
+  }
+}
+
+// Issue #174: Clean up expired failed_events rows (retention policy).
+async function cleanupExpiredFailedEvents(): Promise<void> {
+  try {
+    await pool.query('SELECT delete_expired_failed_events()')
+  } catch (err) {
+    console.error(`[indexer] failed to cleanup expired failed_events: ${err instanceof Error ? err.message : String(err)}`)
+  }
 }
 
 /** Wraps `ingestPage`'s whole-page-transaction fast path with the quarantine
@@ -406,11 +514,23 @@ function pageKeyFor(events: rpc.Api.EventResponse[]): string {
  *  `INDEXER_QUARANTINE_AFTER_FAILURES` times running on what
  *  `server.getEvents` deterministically returns for the same unmoved cursor
  *  (i.e. the same page), it's treated as deterministic and the page is
- *  retried one event per transaction so the rest of it can still fold. */
+ *  retried one event per transaction so the rest of it can still fold.
+ *
+ *  Issue #172: State persists in the database now so a restart doesn't reset
+ *  the counter. Load on first use, update on every iteration, persist after
+ *  each decision. */
 async function ingestPageWithQuarantine(events: rpc.Api.EventResponse[], lastLedger: number): Promise<void> {
+  // Issue #172: Load persistent state on first use
+  if (!quarantineStateLoaded) {
+    quarantineState = await loadQuarantineState()
+    quarantineStateLoaded = true
+  }
+
   try {
     await ingestPage(events, lastLedger)
+    // Fold succeeded — clear quarantine state and persist
     quarantineState = null
+    await persistQuarantineState(null)
     return
   } catch (err) {
     if (err instanceof ReorgDetectedError) throw err
@@ -423,6 +543,9 @@ async function ingestPageWithQuarantine(events: rpc.Api.EventResponse[], lastLed
       quarantineState = { pageKey, errorMessage, failures: 1 }
     }
 
+    // Persist after every failure
+    await persistQuarantineState(quarantineState)
+
     if (quarantineState.failures < config.indexer.quarantineAfterFailures) {
       // Might still be transient — let runIndexer's normal backoff-and-retry
       // give it another chance before concluding it's deterministic.
@@ -433,11 +556,15 @@ async function ingestPageWithQuarantine(events: rpc.Api.EventResponse[], lastLed
       `[indexer] page failed ${quarantineState.failures} consecutive times with the same error — ` +
         `switching to per-event quarantine mode. ${errorMessage}`
     )
+    // Issue #174: Mark escalation for alerting
+    await persistQuarantineState(quarantineState, true)
+
     for (const raw of events) {
       const ev = decodeEvent(raw)
       await ingestEventQuarantined(ev, lastLedger)
     }
     quarantineState = null
+    await persistQuarantineState(null)
   }
 }
 

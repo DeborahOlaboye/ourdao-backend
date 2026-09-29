@@ -37,6 +37,6 @@ describe('API: rate limiting', () => {
     expect(res.statusCode).toBe(429)
     expect(res.headers['retry-after']).toBeDefined()
     const body = res.json()
-    expect(body.message).toBeDefined()
+    expect(body.error).toBeDefined()
   })
 })

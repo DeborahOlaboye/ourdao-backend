@@ -81,6 +81,11 @@ export function resolveConfig(env: NodeJS.ProcessEnv) {
     // INDEXER_STALE_AFTER_MS. In-process only: with more than one API
     // instance they may briefly disagree.
     statsCacheMs: int(env, 'STATS_CACHE_MS', 5_000),
+    // Aggregate stats are intentionally lower priority than ordinary reads.
+    // Do not queue concurrent recomputations: a full slot sheds immediately
+    // so members, proposals, and loan reads keep a connection available.
+    statsMaxConcurrent: int(env, 'STATS_MAX_CONCURRENT', 1),
+    statsRetryAfterSeconds: int(env, 'STATS_RETRY_AFTER_SECONDS', 1),
     // Issue #156: concurrent SSE stream bounds. Open streams no longer each
     // cost a database connection (issue #152 — they share one process-wide
     // LISTEN connection), but still cost a socket/file descriptor and a
@@ -128,6 +133,16 @@ export function resolveConfig(env: NodeJS.ProcessEnv) {
     // covers this codebase's heaviest query (reindex uses its own
     // long-lived connection, not this pool, and is unaffected).
     statementTimeoutMs: int(env, 'DB_STATEMENT_TIMEOUT_MS', 10_000),
+    // Issue #196: how long an idle pooled connection is kept before being
+    // closed (pg's own default, 30s, made explicit and tunable). `0` disables
+    // idle eviction.
+    idleTimeoutMs: int(env, 'DB_IDLE_TIMEOUT_MS', 30_000),
+    // Issue #196: shown in `pg_stat_activity.application_name` so the API,
+    // the worker and one-off reindexes sharing a database can be told apart.
+    // An explicit DB_APPLICATION_NAME wins; otherwise it is derived from the
+    // process role (`OURDAO_PROCESS_ROLE`, set by src/worker.ts before the
+    // pool is created, defaulting to `api`).
+    applicationName: str(env, 'DB_APPLICATION_NAME') || `ourdao-${str(env, 'OURDAO_PROCESS_ROLE', 'api')}`,
   },
   stellar: {
     contractId: str(env, 'CONTRACT_ID'),

@@ -4,6 +4,7 @@ import { pool, query } from '../src/db/index.js'
 import { applyEvent } from '../src/indexer/handlers.js'
 import { closeDb, resetDb } from './db.js'
 import { decodedEvent } from './fixtures.js'
+import { STREAM_CHANNELS } from '../src/api/stream.js'
 import type { LoanProposalRow, LoanRow, MemberRow } from '../src/types.js'
 
 describe('indexer handlers: loans', () => {
@@ -162,7 +163,7 @@ describe('indexer handlers: loans', () => {
 
     await expect(
       applyEvent(client, decodedEvent('loan_rej', { id: 99998, for_votes: '1', against_votes: '1' }))
-    ).resolves.toBeUndefined()
+    ).resolves.toBe(STREAM_CHANNELS.loan_proposals)
   })
 
   it('loan_appr marks the proposal approved, opens a loan seeded with total_repayment (not the bare principal), and flags the borrower as having an active loan', async () => {
@@ -324,12 +325,12 @@ describe('indexer handlers: loans', () => {
     // Unknown proposal id is a no-op, doesn't throw
     await expect(
       applyEvent(client, decodedEvent('loan_exp', { proposal_id: 99999, borrower: 'GBORROWER' }))
-    ).resolves.toBeUndefined()
+    ).resolves.toBe(STREAM_CHANNELS.loan_proposals)
   })
 
   it('interest is a documented no-op (no per-member payload to apply)', async () => {
     await expect(
       applyEvent(client, decodedEvent('interest', { interest: '500', active: 10 }))
-    ).resolves.toBeUndefined()
+    ).resolves.toBe(STREAM_CHANNELS.interest)
   })
 })
