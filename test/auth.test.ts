@@ -134,16 +134,21 @@ describe('MemoryNonceStore (#72)', () => {
     vi.useRealTimers()
   })
 
-  it('issue() returns the same nonce for the same address if not expired, distinct for different addresses', async () => {
+  it('issue() returns distinct nonces each time (issue #180)', async () => {
     const store = new MemoryNonceStore()
     const a1 = await store.issue('GA')
     const a2 = await store.issue('GA')
     const b1 = await store.issue('GB')
     for (const n of [a1, a2, b1]) expect(n).toMatch(/^[0-9a-f]{64}$/)
-    // a1 and a2 should be the same (nonce not expired)
-    expect(a1).toBe(a2)
-    // b1 should be different (different address)
+    // Issue #180: a1 and a2 should be different to support independent sessions on separate devices
+    expect(a1).not.toBe(a2)
+    // b1 should also be different (different address)
     expect(b1).not.toBe(a1)
+    expect(b1).not.toBe(a2)
+    // Both nonces should be valid for their respective addresses
+    expect(await store.consume('GA', a1)).toBe(true)
+    expect(await store.consume('GA', a2)).toBe(true)
+    expect(await store.consume('GB', b1)).toBe(true)
     await store.shutdown()
   })
 
@@ -186,6 +191,25 @@ describe('MemoryNonceStore (#72)', () => {
     vi.advanceTimersByTime(6 * 60 * 1000) // sweep runs every 60s; entry expires at 300s
     const internal = (store as unknown as { store: Map<string, unknown> }).store
     expect(internal.size).toBe(0)
+    await store.shutdown()
+  })
+
+  it('concurrent issue calls do not clobber each other (issue #179)', async () => {
+    const store = new MemoryNonceStore()
+
+    // Issue #180: support multiple nonces per address
+    const [nonce1, nonce2] = await Promise.all([
+      store.issue(G),
+      store.issue(G),
+    ])
+
+    // Both nonces should be distinct
+    expect(nonce1).not.toBe(nonce2)
+
+    // Both nonces should be valid
+    expect(await store.consume(G, nonce1)).toBe(true)
+    expect(await store.consume(G, nonce2)).toBe(true)
+
     await store.shutdown()
   })
 })
@@ -314,16 +338,18 @@ describe('structured logging, not console (issues #132, #133)', () => {
     return { logger, debugCalls, warnCalls }
   }
 
-  it('MemoryNonceStore.issue logs a repeat nonce through the given logger, truncated, never through console', async () => {
+  it('MemoryNonceStore.issue logs through the given logger, truncated, never through console (issue #181)', async () => {
     const debugSpy = vi.spyOn(console, 'debug').mockImplementation(() => {})
     const store = new MemoryNonceStore()
     const { logger, debugCalls } = fakeLogger()
     await store.issue(G, logger)
-    await store.issue(G, logger) // second call hits the "existing nonce" branch
+    await store.issue(G, logger) // Issue #180: each call returns a distinct nonce
 
-    expect(debugCalls).toHaveLength(1)
+    expect(debugCalls).toHaveLength(2)
     expect(debugCalls[0]).toContain(`${G.slice(0, 4)}…${G.slice(-4)}`)
     expect(debugCalls[0]).not.toContain(G)
+    expect(debugCalls[1]).toContain(`${G.slice(0, 4)}…${G.slice(-4)}`)
+    expect(debugCalls[1]).not.toContain(G)
     expect(debugSpy).not.toHaveBeenCalled()
 
     debugSpy.mockRestore()

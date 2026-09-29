@@ -251,11 +251,16 @@ CREATE TABLE IF NOT EXISTS documents (
 );
 CREATE INDEX IF NOT EXISTS documents_proposal_idx ON documents (kind, proposal_id, ledger DESC);
 
--- Authentication nonces for Stellar-signed login (issues #63, #66)
+-- Authentication nonces for Stellar-signed login (issues #63, #66, #179, #180)
+-- Keyed on nonce (primary key) with a non-unique index on address to support:
+-- - Multiple outstanding nonces per address (issue #180)
+-- - Atomic nonce issuance without race conditions (issue #179)
+-- - Per-address rate limiting (issue #180)
 CREATE TABLE IF NOT EXISTS auth_nonces (
-  address    TEXT PRIMARY KEY,
-  nonce      TEXT NOT NULL,
+  nonce      TEXT PRIMARY KEY,
+  address    TEXT NOT NULL,
   expires_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS auth_nonces_expires_at_idx ON auth_nonces (expires_at);
+CREATE INDEX IF NOT EXISTS auth_nonces_address_idx ON auth_nonces (address);

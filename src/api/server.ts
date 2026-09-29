@@ -78,6 +78,11 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
     nonceStore = new MemoryNonceStore()
   }
 
+  // Issue #182: register shutdown hook to clean up nonce store timers on close
+  app.addHook('onClose', async () => {
+    await nonceStore.shutdown()
+  })
+
   await app.register(etag)
 
   // ── CORS ──

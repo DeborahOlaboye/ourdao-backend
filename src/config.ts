@@ -106,6 +106,10 @@ export function resolveConfig(env: NodeJS.ProcessEnv) {
     connectionString: str(env, 'DATABASE_URL') || undefined,
     // Nonce store implementation: 'postgres' for production (multi-instance), 'memory' for testing (issue #66)
     nonceStore: nonceStore(env, 'NONCE_STORE', 'postgres'),
+    // Issue #181: nonce TTL and sweep intervals are now configurable
+    nonceTtlMs: int(env, 'NONCE_TTL_MS', 5 * 60 * 1000),
+    nonceMaxEntries: int(env, 'NONCE_MAX_ENTRIES', 10000),
+    nonceSweepIntervalMs: int(env, 'NONCE_SWEEP_INTERVAL_MS', 60 * 1000),
     // Issue #152: explicit request-pool size instead of relying on
     // node-postgres's implicit default (also 10). Made explicit — and
     // configurable — now that /api/stream no longer takes a connection per
