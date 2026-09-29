@@ -128,6 +128,14 @@ All configuration is environment-driven — see [`.env.example`](./.env.example)
 | `TRUST_PROXY` | Set to `"true"` behind a reverse proxy so rate limits apply per client IP. |
 | `LOG_LEVEL` | Pino log level for the Fastify server (`fatal`, `error`, `warn`, `info`, `debug`, `trace`, `silent`). Default `info` (logs a line per request). `silent` suppresses all request logging, which the test harness uses. |
 | `TEST_DATABASE_URL` | Separate database `npm test` runs against — never the dev DB. |
+| `SOURCE_COMMIT` / `BUILD_DATE` | Build metadata exposed by `/version`; normally injected by the Docker build. |
+| `RUN_RPC_SMOKE` | Set to `true` to opt into the live Soroban RPC smoke test. |
+
+The nonce TTL, in-memory capacity, and cleanup cadence are fixed in
+`src/auth.ts`; they are documented in `.env.example` but are not operator
+settings. The stream heartbeat interval and channel set are likewise fixed in
+`src/api/stream.ts`. `NODE_ENV` and `VITEST` are owned by the runtime and test
+runner rather than read as application configuration.
 
 **Note:** The indexer (worker process) uses `console.log`/`console.error` directly and does not respect `LOG_LEVEL`. Its output is always shown regardless of this setting.
 
@@ -205,6 +213,10 @@ The full topic-symbol → data-tuple mapping this service decodes (kept in sync 
 
 ## API reference
 
+The unversioned `/api` contract is additive-only. See the
+[API compatibility policy](./docs/API_COMPATIBILITY.md) for the concrete
+definition of a breaking change, the versioning and deprecation process, and
+the required coordination with `ourdao-frontend`.
 **Machine-readable OpenAPI specification:** [`openapi.json`](./openapi.json)
 
 Interactive documentation is available at `/docs` when running the development server (`npm run dev`).

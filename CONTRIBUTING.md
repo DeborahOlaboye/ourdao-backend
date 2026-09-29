@@ -79,6 +79,15 @@ Two more checks CI runs that aren't in the list above:
 
 ## Backend-specific rules
 
+### Preserve the API contract
+
+Read [the API compatibility policy](./docs/API_COMPATIBILITY.md) before
+changing a route. `/api` is additive-only: removing or renaming fields,
+changing JSON types or established status codes, tightening accepted input,
+and changing authentication are breaking changes and require a versioned
+path. Consumer-facing changes must link the corresponding
+`ourdao-frontend` issue or pull request so reviewers can verify rollout order.
+
 - **This service is strictly read-only with respect to the chain.** It never holds a private key, never signs, and never submits a transaction. Any pull request that introduces a signing path, a key in config, or an outbound write to the network will be rejected regardless of quality — that's an architectural boundary, not a preference.
 - **The `events` table is append-only.** Raw indexed events are the audit trail. Derived tables (`members`, `loans`, `loan_proposals`, `treasury_proposals`, `notifications`) are rebuilt from it. Don't mutate or delete rows in `events`.
 - **Event folding stays transactional.** Writing a raw event and folding it into derived tables happens inside one database transaction so a crash can't leave them inconsistent. New event handlers must preserve that.
